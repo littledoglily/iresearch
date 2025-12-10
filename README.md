@@ -1,17 +1,19 @@
-<!--
-|Branch      |Status   |
-|------------|---------|
-|master      |[![Build Status][travisMasterBadge]][travisLink] [![Build status][AppveyorMasterBadge]][AppveyorLink] |
+# ⚠️ Project Moved to [SereneDB](https://github.com/serenedb/serenedb)
 
-[travisMasterBadge]: https://travis-ci.org/iresearch-toolkit/iresearch.svg?branch=master "Linux"
-[travisLink]: https://travis-ci.org/iresearch-toolkit/iresearch "Linux"
-[AppveyorMasterBadge]: https://ci.appveyor.com/api/projects/status/umr1pa805v7xa54a/branch/master?svg=true "Windows"
-[AppveyorLink]: https://ci.appveyor.com/project/gnusi/iresearch/branch/master "Windows"
--->
+**This repository is now archived.**
 
-# !!! THE PROJECT IS ARCHIVED AND NO LONGER MAINTAINED !!!
+The project continues development as **[SereneDB](https://github.com/serenedb/serenedb)**.
 
+### We need your support!
+If you have used `iresearch`, please support the team by **[giving the new SereneDB repository a Star ⭐](https://github.com/serenedb/serenedb)**.
 
+**What you need to know:**
+* **Still Open Source:** [SereneDB](https://github.com/serenedb/serenedb) remains **Open Source** and is licensed under **Apache 2.0**.
+* **Same Team, New Era:** This is the official continuation by the original authors.
+* **Funded & Growing:** [SereneDB](https://github.com/serenedb/serenedb) has [received funding](https://www.serenedb.com/blog/pre-seed-funding) to bring real-time search and analytics to the next level.
+* **Official Successor:** Any other projects or forks claiming to be the successor are unrelated to the original authors.
+
+👉 **Visit the new home:** [https://github.com/serenedb/serenedb](https://github.com/serenedb/serenedb)
 
 # IResearch search engine
 
