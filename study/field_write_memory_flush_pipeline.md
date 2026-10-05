@@ -1636,11 +1636,59 @@ zigzag 的作用可以用第二行直观看到:残差 `[0,0,0,0,−1]` 若直接
 
 列类型由 `fixed_length_`/`prev_avg_` 推断:所有值等长 → `kFixed`(等长且为 0 → `kMask`);否则 `kSparse`。"哪些文档有值"的位图由 `sparse_bitmap_writer` 按 65536 文档一块记录,块内:**>4095 个文档用 bitset**(满块则省略),否则写**uint16 数组**;并写到 `.csd`(`docs_index`)。
 
-#### 3.2.5 例:STORE 列 `id` —— 从 `BufferedColumn` 到 `.csd` / `.csi` 的字节
+#### 3.2.5 例:STORE 列 `id` —— 从 0 字节开始,构造 `_0.csd` / `_0.csi`
 
-沿用 2.8:5 个文档,`id` 依次为 `a1..a5`,有 comparator,所以 `id` 是 `cached_column` → `BufferedColumn`。flush 时三列的处理顺序是:排序列(列 id 0)→ `cached_columns_[0]` = `norm(body)`(列 id 1)→ `cached_columns_[1]` = `id`(列 id 2)。列 id 就是 `push_column` 的先后顺序。
+沿用 2.8:5 个文档,`id` 依次为 `a1..a5`。这个段一共有 **3 个列**,它们共用同一个 `_0.csd` 和同一个 `_0.csi`,所以 `id` 的字节不会从文件的 0 开始 —— 前面有文件 header 和另外两列。为了看清每个偏移是怎么来的,本节**从两个空文件开始,按写入顺序把字节一段一段追加上去**,`id` 只是其中的最后一段。
 
-**① flush 前的内存**(2.8.3):
+**三个列与列 id**(列 id 就是 `push_column` 的先后顺序,flush 的顺序是:排序列 → `cached_columns_[0]` → `cached_columns_[1]`):
+
+| 列 id | 来源 | 列名 | 值 | 类型 | 详细推导 |
+|---|---|---|---|---|---|
+| 0 | `sort_.stream`(STORE_SORTED `title`) | 无(匿名) | 变长字符串 | `kSparse` | 3.2.6 |
+| 1 | `cached_columns_[0]` = `norm(body)` | 无(匿名) | 4 B 定长 | `kFixed` | 3.2.7 |
+| 2 | `cached_columns_[1]` = `id` | `"id"` | 3 B 定长 | `kFixed` | 本节 |
+
+**时间线:每一步改了哪个文件**(完整版见 3.5.1):
+
+| 步骤 | 发生了什么 | `.csd` | `.csi` |
+|---|---|---|---|
+| S0 | `writer::prepare`:创建 `.csd`,写 header | 0 → 38 | (还不存在) |
+| F1 | 排序列 `push_column`(列 id 0),排序 + 生成 docmap,值写进 `column` 的**内存**缓冲 | 不变 | — |
+| F2 | `norm(body)` `push_column`(列 id 1),按 docmap 重排,写进内存缓冲 | 不变 | — |
+| F3 | `id` `push_column`(列 id 2),按 docmap 重排,写进内存缓冲 | 不变 | — |
+| F4a | `commit` → 三列依次 `finalize` → `flush_block`,把内存缓冲追加到 `.csd` | 38 → 106 | — |
+| F4b | `commit` → 创建 `.csi`,写 header + 列数 + 三列的记录 + footer;随后给 `.csd` 写 footer | 106 → 122 | 0 → 296 |
+
+**两个文件的最终布局**(下面每一小节会解释其中一段):
+
+```text
+_0.csd  (共 122 B)                         _0.csi  (共 296 B)
+[0, 38)     38B  header                    [0, 39)      39B  header
+[38, 46)     8B  列0 偏移表                [39, 40)      1B  vint(列数=3)
+[46, 71)    25B  列0 值区                  [40, 127)    87B  列0 的记录(title,匿名)
+[71, 91)    20B  列1 值区                  [127, 207)   80B  列1 的记录(norm,匿名)
+[91, 106)   15B  列2 值区 ← id             [207, 280)   73B  列2 的记录(id)   ← id
+[106, 122)  16B  footer                    [280, 296)   16B  footer
+```
+
+##### S0:`.csd` 的 header —— `[0, 38)`
+
+`columnstore2::writer::prepare` 在段开始、**还没有任何文档**时就创建 `.csd` 并写 header(`format_utils::write_header`:`int32 magic` + `string(格式名)` + `int32 版本`,`int` 都是大端,`string` 是 `vint(长度)` + 字节):
+
+| `.csd` 偏移 | 长度 | 字节 | 含义 |
+|---|---|---|---|
+| 0 | 4 | `3f d7 6c 17` | magic `0x3fd76c17` |
+| 4 | 1 | `1d` | vint(格式名长度 = 29) |
+| 5 | 29 | `69 72 65 73 65 61 72 63 68 5f 31 31 5f 63 6f 6c 75 6d 6e 73 74 6f 72 65 5f 64 61 74 61` | `"iresearch_11_columnstore_data"` |
+| 34 | 4 | `00 00 00 00` | 版本 `Version::kMin = 0` |
+
+共 4 + 1 + 29 + 4 = **38 B**。此后所有列的块都从偏移 38 开始追加。
+
+##### F1~F3:三列进入内存缓冲(此时两个文件都没有变化)
+
+每个列的处理都是 "按新 doc 顺序逐个 `Prepare(新key)` + 拷值" 写进 `column` 的内存缓冲(`data_` + `addr_table_` + 位图),**不写文件**。`id` 的过程:
+
+**① flush 前的内存**(2.8.3):`id` 有 comparator,所以是 `cached_column` → `BufferedColumn`:
 
 ```text
 BufferedColumn "id"
@@ -1658,13 +1706,78 @@ BufferedColumn "id"
 | 新4 | 旧 doc2 | `02 61 33 02 61 31 02 61 35 02 61 32` | `[0, 3, 6, 9]` | `{1,2,3,4}` |
 | 新5 | 旧 doc4 | `02 61 33 02 61 31 02 61 35 02 61 32 02 61 34` | `[0, 3, 6, 9, 12]` | `{1,2,3,4,5}` |
 
-**③ commit → `flush_block`**(偏移表压缩原理见 3.2.3):
+排序列(F1)和 `norm(body)`(F2)的这一步见 3.2.6 / 3.2.7。到这里为止 `.csd` 还只有 38 B 的 header。
 
-- `addr_table_ = [0,3,6,9,12]`,`avg = 3`,残差全 0 → `bits = ALL_EQUAL`,**偏移表整个省略**。`last_size = 15 − 12 = 3 == avg` → 这是**定长列**(`kFixed`)。
-- 此时 `.csd` 已有 header(38 B)+ 列 0 块(33 B)+ 列 1 块(20 B)= 91 B,所以本块 `block.addr = 91`;值区 15 B 追加在 `.csd[91, 106)`;因为没有偏移表,`block.data = 0 + 91 = 91`。
+##### F4a:`commit` 把三列的块依次追加进 `.csd`
+
+`commit` 对每列 `finalize()` → `flush_block`(偏移表压缩原理见 3.2.3)。**先 flush 的列占前面的位置**,所以顺序是列 0、列 1、列 2:
+
+| 列 | `.csd` 区间 | 内容 | `block.addr` | `block.data` |
+|---|---|---|---|---|
+| 0 `title` | `[38, 46)` 偏移表 + `[46, 71)` 值区 | 变长,有偏移表 | 38 | 0 + 46 = 46 |
+| 1 `norm(body)` | `[71, 91)` 值区 | 定长,无偏移表 | 71 | 71 |
+| 2 `id` | `[91, 106)` 值区 | 定长,无偏移表 | 91 | 91 |
+
+`block.addr` 是块在 `.csd` 里的起点;`block.data` = 偏移基准(第一个偏移,恒为 0) + 值区起点。没有偏移表时值区紧跟块起点,所以 `addr == data`。
+
+**列 0(`title`)—— `[38, 71)`,33 B**:
+
+- 文件指针此时是 38(header 刚好写完),`block.addr = 38`。
+- 值的长度 5,5,5,4,6,起始偏移 `[0,5,10,15,19]`,`avg = round(19/4) = 5`,预测 `0,5,10,15,20`,残差 `[0,0,0,0,zigzag(−1)=1]`,最大位宽 `bits = 1`,不是全等,**必须写偏移表**。
+- **偏移表 8 B** `.csd[38,46)`:补零到 64 个元素,每个 1 位,下标 4 的元素为 1,放在第一个 `uint64` 的第 4 位 → `0x10`,小端写出 `10 00 00 00 00 00 00 00`。
+- **值区 25 B** `.csd[46,71)`:`data_` 整体拷出 `04 70 6c 75 6d | 04 70 65 61 72 | 04 6b 69 77 69 | 03 66 69 67 | 05 61 70 70 6c 65`(plum pear kiwi fig apple,已按 docmap 排好)。此时文件指针才是 46,所以 `block.data = 0 + 46 = 46`。
+- `last_size = 25 − 19 = 6`;长度不等 → `kSparse`。
+
+**列 1(`norm(body)`)—— `[71, 91)`,20 B**:文件指针 71,偏移 `[0,4,8,12,16]`,`avg = 4`,残差全 0 → `ALL_EQUAL`,**不写偏移表**,值区 `00 00 00 02 00 00 00 03 00 00 00 01 00 00 00 02 00 00 00 02` 直接追加,`block.addr = block.data = 71`;`last_size = 4 == avg` → `kFixed`。
+
+**列 2(`id`)—— `[91, 106)`,15 B**:
+- 文件指针 **91 = 38 + 33 + 20**,所以 `block.addr = 91`。
+- `addr_table_ = [0,3,6,9,12]`,`avg = 3`,残差全 0 → `bits = ALL_EQUAL`,**偏移表整个省略**。`last_size = 15 − 12 = 3 == avg` → **定长列**(`kFixed`)。
+- 值区 `02 61 33 02 61 31 02 61 35 02 61 32 02 61 34` 追加在 `.csd[91, 106)`;没有偏移表,`block.data = 0 + 91 = 91`。
 - `column::finish`:`min + docs_count − 1 = 1 + 5 − 1 = 5 == pend_`,说明 doc 1..5 **每个文档都有值**,**不写稀疏位图**,`docs_index = 0`。
 
-**④ `.csi` 里 `id` 的记录**(列按列名排序,匿名列在前,`id` 排在最后):
+**footer —— `[106, 122)`,16 B**:`commit` 先写完 `.csi`(见下),最后才对 `.csd` 调 `format_utils::write_footer`:
+
+| `.csd` 偏移 | 长度 | 字节 | 含义 |
+|---|---|---|---|
+| 106 | 4 | `c0 28 93 e9` | `-magic`(`-0x3fd76c17`) |
+| 110 | 4 | `00 00 00 00` | 算法号 0 |
+| 114 | 8 | (到此处为止所有字节的校验和) | checksum |
+
+##### F4b:`.csi` 从 0 开始 —— 前面是 header、列数和另外两列的记录
+
+`commit` 在三列都 flush 完之后才创建 `.csi`。先写 header 和列数,再按列名排序后逐列 `column::finish`(`kNoName` 的匿名列排在前面,所以顺序是列 0、列 1、列 2):
+
+**header 与列数 —— `[0, 40)`**:
+
+| `.csi` 偏移 | 长度 | 字节 | 含义 |
+|---|---|---|---|
+| 0 | 4 | `3f d7 6c 17` | magic |
+| 4 | 1 | `1e` | vint(格式名长度 = 30) |
+| 5 | 30 | `69 72 65 73 65 61 72 63 68 5f 31 31 5f 63 6f 6c 75 6d 6e 73 74 6f 72 65 5f 69 6e 64 65 78` | `"iresearch_11_columnstore_index"` |
+| 35 | 4 | `00 00 00 00` | 版本 0 |
+| 39 | 1 | `03` | vint(列数 = 3) |
+
+**列 0(`title`)的记录 —— `[40, 127)`,87 B**(推导见 3.2.6):
+
+| `.csi` 偏移 | 长度 | 含义 |
+|---|---|---|
+| 40 | 29 | string(压缩器名)= `"iresearch::compression::none"`(`1c` + 28 字节) |
+| 69 | 24 | column_header{docs_index=0, id=0, min=1, docs_count=5, type=kSparse, props=kNoName} |
+| 93 | 1 | string(payload)= 空 |
+| 94 | 33 | 块元数据:addr=38, avg=5, bits=1, data=46, last_size=6 |
+
+**列 1(`norm(body)`)的记录 —— `[127, 207)`,80 B**(推导见 3.2.7):
+
+| `.csi` 偏移 | 长度 | 含义 |
+|---|---|---|
+| 127 | 29 | string(压缩器名) |
+| 156 | 24 | column_header{docs_index=0, id=1, min=1, docs_count=5, type=kFixed, props=kNoName} |
+| 180 | 11 | string(payload)= Norm2Header |
+| 191 | 8 | long(avg=4) |
+| 199 | 8 | 块×1:long(data=71) |
+
+**列 2(`id`)的记录 —— `[207, 280)`,73 B**,这才是 `id`。它的第一个字节在 207,因为 `207 = 39 + 1 + 87 + 80`:
 
 | `.csi` 偏移 | 长度 | 字节 | 含义 |
 |---|---|---|---|
@@ -1675,6 +1788,10 @@ BufferedColumn "id"
 | 264 | 8 | `00 00 00 00 00 00 00 03` | long(avg=3) |
 | 272 | 8 | `00 00 00 00 00 00 00 5b` | 块×1: long(data=91) |
 
+**footer —— `[280, 296)`**:`c0 28 93 e9 · 00 00 00 00 · checksum(8B)`,格式同 `.csd`。
+
+> `column_header` 的 24 B 按 `write_header`([columnstore2.cpp:69](core/formats/columnstore2.cpp#L69))顺序是:`long docs_index`(8) · `int id`(4) · `int min`(4) · `int docs_count`(4) · `type`(2) · `props`(2),`type`/`props` 各按 2 字节枚举写出。以 `id` 列为例:`00…00`(docs_index=0) · `00 00 00 02`(id=2) · `00 00 00 01`(min=1) · `00 00 00 05`(docs_count=5) · `00 02`(kFixed) · `00 00`(kNormal)。
+
 **⑤ 内存 → 文件字节 对应表**
 
 | 内存里的东西 | 变成了文件里的什么 |
@@ -1683,10 +1800,10 @@ BufferedColumn "id"
 | `index_` 5 条 `{key,begin,size}` | **不落盘**,只用来重排;落盘的是等长规则 `avg=3` + `data=91` |
 | `column.addr_table_ [0,3,6,9,12]` | 压缩后**没有表**(`ALL_EQUAL`) |
 | `column` 位图 `{1..5}` | 不落盘(`docs_index=0` 表示每个文档都有值) |
-| `stored_column.name = "id"` | `.csi` 的 `string(列名)` = `02 69 64` |
-| 列 id 2(`push_column` 顺序) | `column_header.id` = `00 00 00 02` |
+| `stored_column.name = "id"` | `.csi[261,264)` 的 `string(列名)` = `02 69 64` |
+| 列 id 2(`push_column` 顺序) | `column_header.id` = `00 00 00 02`;并决定了它在 `.csd` / `.csi` 里排在最后 |
 
-**⑥ 读回验证**:读新 doc2 的 `id`。定长列:`data + (2−1)×avg = 91 + 3 = 94`,读到 `02 61 31` = `"a1"`。2.8 里 `docmap[1] = 2`,即旧 doc1 变成新 doc2,值 `a1` 正是旧 doc1 的 `id`。
+**⑥ 读回验证**:读新 doc2 的 `id`。先在 `.csi` 里找到列 2 的记录(按列 id 索引),得 `type=kFixed, avg=3, data=91`;定长列:`data + (2−1)×avg = 91 + 3 = 94`,读到 `.csd[94,97)` = `02 61 31` = `"a1"`。2.8 里 `docmap[1] = 2`,即旧 doc1 变成新 doc2,值 `a1` 正是旧 doc1 的 `id`。
 
 #### 3.2.6 例:STORE_SORTED 列 `title`(排序列)—— 从 `sort_.stream` 到 docmap、`.csd` / `.csi`
 
@@ -1718,11 +1835,11 @@ sort_.stream
 
 **③ commit → `flush_block`**:
 
-- 偏移 `[0,5,10,15,19]`,`avg = round(19/4) = 5`,预测 `0,5,10,15,20`,残差 `[0,0,0,0,zigzag(−1)=1]`,位宽 `bits = 1`。**偏移表 8 B**:64 个 1 位的元素,下标 4 的元素为 1,放在第一个 `uint64` 的第 4 位 → 值 `0x10`,按小端写出 `10 00 00 00 00 00 00 00`,位于 `.csd[38,46)`。
+- 本列是第一个 flush 的块,前面只有 38 B 的 `.csd` header(见 3.2.5 的 S0),所以块从 `.csd[38,…)` 开始。偏移 `[0,5,10,15,19]`,`avg = round(19/4) = 5`,预测 `0,5,10,15,20`,残差 `[0,0,0,0,zigzag(−1)=1]`,位宽 `bits = 1`。**偏移表 8 B**:64 个 1 位的元素,下标 4 的元素为 1,放在第一个 `uint64` 的第 4 位 → 值 `0x10`,按小端写出 `10 00 00 00 00 00 00 00`,位于 `.csd[38,46)`。
 - 值区 25 B 在 `.csd[46,71)`;块元数据:`addr = 38`、`avg = 5`、`bits = 1`、`data = 0 + 46 = 46`、`last_size = 25 − 19 = 6`。
 - 值长度不等(`last_size ≠ avg`)→ **变长列 `kSparse`**。排序列的 `finalizer` 是空的,所以没有列名(`kNoName`);每个文档都有值,`docs_index = 0`。
 
-**④ `.csi` 里排序列的记录**(匿名列,排在最前):
+**④ `.csi` 里排序列的记录**(匿名列,排在最前;前面是 39 B header + 1 B 列数,所以从偏移 40 开始,见 3.2.5):
 
 | `.csi` 偏移 | 长度 | 字节 | 含义 |
 |---|---|---|---|
@@ -1764,7 +1881,7 @@ BufferedColumn "norm(body)"
 
 **③ commit**:
 
-- `flush_block`:偏移 `[0,4,8,12,16]`,`avg = 4`,残差全 0 → `ALL_EQUAL`,无偏移表;`last_size = 4 == avg` → **定长列 `kFixed`**。值区 20 B 在 `.csd[71,91)`(`block.addr = block.data = 71`)。
+- `flush_block`(紧跟在列 0 的块之后,文件指针 = 38 + 33 = 71):偏移 `[0,4,8,12,16]`,`avg = 4`,残差全 0 → `ALL_EQUAL`,无偏移表;`last_size = 4 == avg` → **定长列 `kFixed`**。值区 20 B 在 `.csd[71,91)`(`block.addr = block.data = 71`)。
 - `finalize`:调 `finalizer` → `Norm2Writer::finish` 把 `hdr_` 写成列 **payload**:`[version 00][宽度 04][min 00 00 00 01][max 00 00 00 03]` 共 10 B。finalizer 返回的名字是空 → 匿名列(`kNoName`)。
 
 **④ `.csi` 里的记录**:
@@ -1793,7 +1910,7 @@ BufferedColumn "norm(body)"
 
 ### 3.3 INDEX → `.tm` `.ti` `.doc` `.pos` `.pay`
 
-> 机制见 3.3.1~3.3.2;沿用 2.8 数据的转换例子:**3.3.3 INDEX 字段 `body`**(多文档 term,有 freq/pos)、**3.3.4 INDEX 字段 `title`**(单文档 term,无 freq/pos)。
+> 机制见 3.3.1~3.3.2(3.3.1.2~3.3.1.4 是 `.doc/.pos/.pay` 写入过程的图示和三个例子,3.3.2.2~3.3.2.3 是 `.tm` 块构造的图示和两个例子);沿用 2.8 数据的转换例子:**3.3.3 INDEX 字段 `body`**(多文档 term,有 freq/pos)、**3.3.4 INDEX 字段 `title`**(单文档 term,无 freq/pos)。
 
 入口 `fields_data::flush`([field_data.cpp:1125](core/index/field_data.cpp#L1125)):
 
@@ -1812,7 +1929,7 @@ BeginTerm:  记下 .doc/.pos/.pay 当前文件指针(doc_start/pos_start/pay_sta
             满 128 → 增量编码 docs,write_block32 写 .doc(先 docs 后 freqs)
             AddPosition → pos_buf[128](位置增量);offs/payload 进 pay 缓冲
             位置缓冲满 128 → write_block32 写 .pos;payload/offset 满块 → .pay
-            每个 doc 满块时,通过 skip_ 记录 skip 条目(doc_delta, doc_ptr 增量, pos 信息...)
+            满块之后的下一个文档到来(docs[] 为空)时,通过 skip_ 记录 skip 条目(block_last, doc_ptr 增量, pos 信息...),详见 3.3.1.3
 EndTerm:    不足 128 的尾部文档用 vint 写入 .doc:
               有 freq:  freq==1 → vint(shift_pack(delta,true));否则 vint(shift_pack(delta,false)) + vint(freq)
               无 freq:  vint(delta)
@@ -1823,6 +1940,222 @@ EndTerm:    不足 128 的尾部文档用 vint 写入 .doc:
 ```
 
 块大小固定 128(`format_traits::block_size()`,[formats_10.cpp:90](core/formats/formats_10.cpp#L90));skip 列表 0 级每 128 个文档一个条目,1 级及以上每 `kSkipN=8` 个下一级条目升一级,最多 `kMaxSkipLevels=9` 级([skip_list.hpp:92-108](core/formats/skip_list.hpp#L92-L108))。
+
+##### 3.3.1.1 总图:内存缓冲 → 三个文件
+
+`postings_writer` 对每个 term 复用同一组**内存缓冲**,缓冲满 128 项就刷成一个"块"写进文件。`.doc` / `.pos` / `.pay` 各自有自己的缓冲和满块条件,**互相不对齐**:
+
+| 内存缓冲(BeginTerm 时清空) | 何时刷出 | 写到哪里 |
+|---|---|---|
+| `docs[128]`(delta 编码后)+ `freqs[128]`(有 FREQ 才有) | 第 128 个文档的 `BeginDocument` 时(此时该文档的位置还没加进来) | `.doc` ← docs 块,紧跟 freqs 块 |
+| `pos.buf[128]`(位置增量,每个文档内从 0 起算) | 第 128 个位置 `AddPosition` 时 | `.pos` ← 一个位置块 |
+| `pay_sizes[128]` + payload 字节 | 跟随 `pos.buf` 满 | `.pay` ← `vint(payload 总字节)` + sizes 块 + payload 字节 |
+| `offs_start[128]` / `offs_len[128]` | 跟随 `pos.buf` 满 | `.pay` ← offs_start 块 + offs_len 块 |
+| skip 条目(内存 `memory_output`,每级一个流) | 写满一个 128 文档块后,**下一个文档到来时**记一条 | `.doc` ← `EndTerm` 时追加在 term 末尾 |
+| 不足 128 的"尾巴" | `EndTerm` 时 | docs / freqs 尾巴(vint)→ `.doc`;位置尾巴(连同 payload / offset 尾巴,vint)→ `.pos` |
+
+关于这张表,有四点容易看错:
+
+1. **`.pay` 只在位置块满 128 时才写**。不足 128 的尾部 payload / offset 是跟在位置后面写进 `.pos` 的,不进 `.pay`(见例 C)。没有 `PAY` / `OFFS` 特征时,`.pay` 文件根本不创建。
+2. **docs 块在第 128 个文档的 `BeginDocument` 就写出**,这时第 128 个文档自己的位置还没加进 `pos.buf`。所以 `.doc` 里一个块的结束点和 `.pos` 里的结束点是错开的;`EndDocument` 把此刻 `pos.buf` 里已有的位置数记为 `pos_.block_last`,放进 skip 条目(例 B 里这个数是 2)。
+3. **满块的编码** `write_block`(128 个 `uint32`):
+
+   ```text
+   128 个值全相等        → [00] [vint(值)]                              2 ~ 6 B   (RL)
+   否则,bits = 最大值位宽 → [bits] [4 组 × bits 个 uint32,小端]            1 + 16×bits B
+                           (每组 32 个值,第 i 个值占该组的第 i×bits 位起;跨 32 位字就拆开)
+   ```
+
+   `bits=1` 时一组 1 个字:值 `[0,1,1,…,1]` → `0xFFFFFFFE` → 小端字节 `fe ff ff ff`。
+4. **docs 块写的是 delta**:`delta[0] = doc[0] − 上一块最后一个文档号`(第一块取 `doc_limits::min()=1`),`delta[i] = doc[i] − doc[i−1]`。
+
+下面三个例子,每个都**从空文件(只有 header)开始,按时间顺序**追加字节。
+
+##### 3.3.1.2 例 A:只有 vint 尾巴的短 posting(2.8 里 `body` 的 `apple` / `pie` / `red`)
+
+3 个 term 的文档数都远小于 128,**没有任何满块**,也没有 skip 列表。三个 term 共用同一个 `.doc` 和同一个 `.pos`,各自接在前一个后面。
+
+```text
+t0 初始状态
+  .doc  [0,40)  header                                .pos  [0,40)  header
+  内存: docs=[] freqs=[] pos.buf=[]
+
+t1 ── term apple ── BeginTerm: doc_start=40, pos_start=40;  block_last = 1(没有满块,取 min)
+  文档2  freq=1 位置[2]       docs=[2]       freqs=[1]       pos.buf=[2]
+  文档4  freq=1 位置[1]       docs=[2,4]     freqs=[1,1]     pos.buf=[2,1]
+  文档5  freq=2 位置[1,2]     docs=[2,4,5]   freqs=[1,1,2]   pos.buf=[2,1,1,1]       ← 文件都还没变
+  EndTerm: 逐个文档 delta = doc − prev(prev 从 1 起):
+     doc2: 2−1=1, freq=1 → vint(shift_pack(1,true)=3)             03
+     doc4: 4−2=2, freq=1 → vint(shift_pack(2,true)=5)             05
+     doc5: 5−4=1, freq=2 → vint(shift_pack(1,false)=2) vint(2)    02 02
+     位置: 02 01 01 01
+  .doc  [40,44)  03 05 02 02                          .pos  [40,44)  02 01 01 01
+  term_meta: docs=3 freq=4 doc_start=40 pos_start=40
+
+t2 ── term pie ──  BeginTerm: doc_start=44, pos_start=44;  缓冲清空
+  (新号) 1:f1[2]  3:f1[1]  4:f1[2]
+  .doc  [44,47)  01 05 03                             .pos  [44,47)  02 01 02
+  term_meta: docs=3 freq=3 doc_start=44 pos_start=44
+
+t3 ── term red ──  BeginTerm: doc_start=47, pos_start=47
+  (新号) 1:f1[1]  2:f2[1,3]
+  .doc  [47,50)  01 02 02                             .pos  [47,50)  01 01 02
+  term_meta: docs=2 freq=3 doc_start=47 pos_start=47
+
+最终(此时 .doc / .pos 都是 50 B;全部字段写完后 end() 各追加 16 B footer)
+  .doc   [0,40) header │ [40,44) apple │ [44,47) pie │ [47,50) red
+  .pos   [0,40) header │ [40,44) apple │ [44,47) pie │ [47,50) red
+```
+
+`red` 的 `.pos` 里 doc2 的位置 `[1,3]` 写成增量 `1, 2`(每个文档内从 0 起算)。**term 之间没有分隔符**:term 的边界靠 `term_meta` 里的 `doc_start` / `pos_start` 记录,由 `.tm` 统计区保存。
+
+##### 3.3.1.3 例 B:300 个文档的 term —— 满块 + skip 列表(假设的例子)
+
+假设某个 term `the`:
+
+- 出现在新文档号 `1..300` 的每个文档里,每个文档 freq=1、位置 `[1]`;
+- 只有文档 100 例外:freq=3、位置 `[1,2,3]`(为了让 `.pos` 的块边界和 `.doc` 错开)。
+
+总 freq=302。它是 `.doc` / `.pos` 里的第一个 term(`doc_start = pos_start = 40`),所属段文档数是 300(`skip_.Prepare` 据此算出最多 1 层 skip:`1 + log₈(300/128 = 2) = 1`)。
+
+下面按**事件**顺序列出两个文件的增长。内存里的 `pos.buf` 用"已缓冲的位置数"表示:
+
+| # | 事件 | `.doc` 长度 | `.pos` 长度 | 说明 |
+|---|---|---|---|---|
+| 0 | 初始 | 40 | 40 | 只有 header |
+| 1 | 文档 1..99、100(freq 3)…126 到来 | 40 | 40 | `docs[]` 在涨;`pos.buf` 涨到 99+3+26 = 128 |
+| 2 | **文档 126 的最后一个位置使 `pos.buf` 满** | 40 | **42** | `.pos` ← 位置块 0 `00 01`(128 个增量全是 1 → RL) |
+| 3 | **文档 128 的 `BeginDocument` 使 `docs[]` 满** | **90** | 42 | `.doc` ← docs 块 0 `[40,57)` + freqs 块 0 `[57,90)`;随后文档 128 的位置进 `pos.buf`,此时 `pos.buf` 有 2 个位置(文档 127、128 各 1 个) |
+| 4 | `EndDocument(128)` | 90 | 42 | `block_last = 128`;`pos_.block_last = 2` |
+| 5 | **文档 129 到来,`docs[]` 为空** → `skip_.Skip(128)` | 90 | 42 | 记 skip 条目 0(只在内存): `block_last=128, Δdoc_ptr=90−40=50, pos_skip=2, Δpos_ptr=42−40=2` |
+| 6 | 文档 254 的位置使 `pos.buf` 再次满 | 90 | **44** | `.pos` ← 位置块 1 `00 01` |
+| 7 | **文档 256 的 `BeginDocument`** | **94** | 44 | `.doc` ← docs 块 1 `[90,92)`、freqs 块 1 `[92,94)`,都是 RL `00 01` |
+| 8 | **文档 257 到来** → `skip_.Skip(256)` | 94 | 44 | skip 条目 1: `block_last=256, Δdoc_ptr=94−90=4, pos_skip=2, Δpos_ptr=44−42=2` |
+| 9 | 文档 257..300 到来 | 94 | 44 | 44 个文档停在 `docs[]` 里;`pos.buf` 涨到 2+44 = 46 |
+| 10 | **`EndTerm`** | **150** | **90** | ① `.doc` 尾巴 44 × `03`(delta=1, freq=1);② `.pos` 尾巴 46 × `01`;③ 记 `pos_end`;④ 追加 skip 列表 |
+
+其中各个块的字节:
+
+```text
+docs 块 0   [40,57)  17 B   01 | fe ff ff ff | ff ff ff ff ff ff ff ff ff ff ff ff
+                            bits=1;delta=[0,1,1,…,1],第 0 个值为 0 → 第一个字 0xFFFFFFFE,其余字 0xFFFFFFFF
+freqs 块 0  [57,90)  33 B   02 | 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 55 | d5 55 55 55 55 55 55 55
+                            bits=2;全是 1 (01) 只有文档 100 是 3 (11)。文档 100 下标 99,在第 4 组(下标 96..127)的第 3 个值,
+                            所以那一字节从 0x55 变成 0xD5
+docs 块 1   [90,92)   2 B   00 01      delta 全是 1 → RL
+freqs 块 1  [92,94)   2 B   00 01
+尾巴 docs   [94,138) 44 B   03 ×44     doc257..300: delta=1(prev 从 block_last=256 起), freq=1 → shift_pack(1,true)=3
+skip 列表   [138,150) 12 B  01 | 0a | 80 01 32 02 02 | 80 02 04 02 02
+```
+
+skip 列表的字节拆开(`FlushLevels`:`vint(层数)`,然后从最高层到第 0 层各一段 `vlong(该层字节数)` + 该层内容):
+
+```text
+01                  vint(层数 = 1)
+0a                  vlong(第 0 层长度 = 10 B)
+80 01 32 02 02      条目 0: vint(block_last=128)  vlong(Δdoc_ptr=50)  vint(pos_skip=2)  vlong(Δpos_ptr=2)
+80 02 04 02 02      条目 1: vint(block_last=256)  vlong(Δdoc_ptr=4)   vint(pos_skip=2)  vlong(Δpos_ptr=2)
+```
+
+`.pos` 的字节:
+
+```text
+[40,42)    00 01            位置块 0
+[42,44)    00 01            位置块 1
+[44,90)    01 ×46           尾巴 46 个位置增量
+```
+
+最终的文件布局:
+
+```text
+.doc (term 部分)                                          .pos (term 部分)
+[0,40)    header                                          [0,40)   header
+[40,57)   docs 块 0   ─┐                                  [40,42)  位置块 0
+[57,90)   freqs 块 0  ─┴ 第 1 个 128 文档块                [42,44)  位置块 1
+[90,92)   docs 块 1   ─┐                                  [44,90)  位置尾巴(46 个 vint)
+[92,94)   freqs 块 1  ─┴ 第 2 个 128 文档块
+[94,138)  文档尾巴(44 个 vint)
+[138,150) skip 列表(2 个条目)
+```
+
+`term_meta` 里留下来的东西:`docs_count=300`、`freq=302`、`doc_start=40`、`pos_start=40`、`pos_end=44−40=4`(**只有 `freq > 128` 才有**:`.pos` 里满块部分的字节数,读的时候用它定位到位置尾巴)、`e_skip_start=138−40=98`(**只有 `docs_count > 128` 才有**:skip 列表在 `.doc` 里相对 `doc_start` 的位置)。`encode` 把它们写进 `.tm` 统计区:
+
+```text
+ac 02   vint(docs_count = 300)
+02      vint(freq − docs_count = 2)
+28      vlong(doc_start = 40,块首条目写绝对值)
+28      vlong(pos_start = 40)
+04      vlong(pos_end = 4)
+62      vlong(e_skip_start = 98)
+```
+
+**读的时候怎么用 skip 列表**(找 `doc ≥ 200`):从 `doc_start + e_skip_start` 读 skip 列表,条目 0 的 `block_last=128 < 200` → 跳到 `doc_start + 50 = 90` 处的块 1(`.doc[90..]`),同时 `.pos` 跳到 `pos_start + 2 = 42` 处,并在这个位置块里先跳过 `pos_skip = 2` 个位置;条目 1 的 `block_last=256 ≥ 200` → 不再往后跳,在块 1 里解出 129..256 的 delta 往后累加,找到 200。
+
+##### 3.3.1.4 例 C:`.pay` 是怎么写出来的(带 payload 和 offset 的 term,假设的例子)
+
+假设一个字段的特征是 `FREQ|POS|OFFS|PAY`,所以 `.pay` 文件存在(header 39 B)。term `x` 有 2 个文档:
+
+- 文档 1:100 个位置 `1..100`;
+- 文档 2:30 个位置 `1..30`。
+
+每个位置的 payload 是 1 字节 `50`;第 `p` 个位置的 offset 是 `[4p, 4p+3)`。位置总数 130 > 128,所以会有 1 个满位置块。
+
+| # | 事件 | `.doc` | `.pos` | `.pay` |
+|---|---|---|---|---|
+| 0 | 初始 | 40 | 40 | 39 |
+| 1 | 文档 1 的 100 个位置、文档 2 的前 27 个位置 | 40 | 40 | 39 |
+| 2 | **文档 2 的第 28 个位置使 `pos.buf` 满(共 128 个)** | 40 | **42** | **175** |
+| 3 | 文档 2 的第 29、30 个位置进 `pos.buf` | 40 | 42 | 175 |
+| 4 | **`EndTerm`** | **44** | **50** | 175 |
+
+事件 2 里三个文件一起动。`AddPosition` 发现位置满了,**先写 `.pos`,再写 `.pay`**:
+
+```text
+.pos [40,42)    00 01                         位置块:128 个增量全是 1 → RL
+
+.pay [39,175)   136 B
+   80 01                      vint(payload 总字节数 = 128)
+   00 01                      pay_sizes 块:128 个 size 全是 1 → RL
+   50 ×128                    payload 字节(128 B)
+   00 04                      offs_start 块:每个 start 增量都是 4 → RL
+   00 03                      offs_len 块:每个长度都是 3 → RL
+```
+
+事件 4(`EndTerm`)写尾巴。文档尾巴:`prev=block_last=1`,**文档 1 的 delta = 1−1 = 0,文档 2 的 delta = 2−1 = 1**,freq 都不是 1:
+
+```text
+.doc [40,44)   00 64 02 1e
+   00   vint(shift_pack(0,false))    文档1: delta=0, freq≠1
+   64   vint(100)                    文档1: freq
+   02   vint(shift_pack(1,false))    文档2: delta=1, freq≠1
+   1e   vint(30)                     文档2: freq
+```
+
+位置尾巴(剩下的 2 个位置)**连同它们的 payload、offset 全部写进 `.pos`**,不进 `.pay`:
+
+```text
+.pos [42,50)   03 01 50 09 03 | 02 50 08
+   第 29 个位置:  03     vint(shift_pack(位置增量=1, size 变了=true))
+                  01     vint(size = 1)
+                  50     payload 字节
+                  09     vint(shift_pack(offset 起点增量=4, len 变了=true))
+                  03     vint(len = 3)
+   第 30 个位置:  02     vint(shift_pack(1, size 没变=false))
+                  50     payload 字节
+                  08     vint(shift_pack(4, len 没变=false))
+```
+
+`term_meta`:`docs_count=2`、`freq=130`、`doc_start=40`、`pos_start=40`、`pos_end=42−40=2`、`pay_start=39`。因为 `freq=130 > 128`,`pos_end` 有效;`docs_count=2 ≤ 128`,没有 skip 列表。`.tm` 统计区:
+
+```text
+02        vint(docs_count = 2)
+80 01     vint(freq − docs_count = 128)
+28 28     vlong(doc_start = 40)  vlong(pos_start = 40)
+02        vlong(pos_end = 2)
+27        vlong(pay_start = 39,块首条目写绝对值)
+```
+
+> 例 B、例 C 是我用与源码相同的逻辑(`postings_writer::write` / `EndTerm` / `WriteSkip` / `bitpack::write_block32`)手工推演出的假设例子,不是 2.8 那批数据的 flush 结果。例 A 的字节与 3.3.3 完全一致。
 
 #### 3.3.2 term 字典:burst trie 块 → `.tm`,前缀 FST → `.ti`
 
@@ -1852,6 +2185,118 @@ EndTerm:    不足 128 的尾部文档用 vint 写入 .doc:
 4. `field_writer::end()`:`.tm` 写 footer;`.ti` 写 `long(字段数)` + footer;`postings_writer::end()` 给 `.doc/.pos/.pay` 写 footer。
 
 读取时的路径(便于理解为什么这么写):`.ti` 读进 FST → 查前缀得到块地址 → 读 `.tm` 块 → 解后缀、统计 → 得到 `doc_start` 等 → 去 `.doc/.pos/.pay` 读 postings。
+
+##### 3.3.2.1 `Push` / `WriteBlocks` 用到的三个状态
+
+```text
+last_term_   上一个 Push 进来的 term
+stack_       待写出的"条目"栈。条目有两种: ET_TERM(一个 term + 它的 term_meta) 和 ET_BLOCK(已经写进 .tm 的一个子块)
+prefixes_[i] 长度为 i+1 的前缀"开始出现"时 stack_ 的高度。  stack_.size() − prefixes_[i] = 这个前缀下积压的条目数
+```
+
+`Push(term)` 每次做三件事:
+
+1. 求 `term` 与 `last_term_` 的公共前缀长度 `pos`;
+2. 对 `last_term_` 里**长度大于 `pos`** 的各个前缀(`i = last.size()−2 … pos`,长度 `i+1`)检查"这个前缀结束了吗":它下面积压的条目数 `top = stack_.size() − prefixes_[i]` 若 **> `min_block_size`(25)**,就 `WriteBlocks(i+1, top)`,把这 `top` 个条目写成一个块(或几个"floor"块),块作为一个 `ET_BLOCK` 条目放回栈顶;
+3. 从 `pos` 起,把 `prefixes_` 里这些位置都设成当前 `stack_.size()`(新前缀从这里开始),并更新 `last_term_`。
+
+term 本身是在 `Push` 之后才 `emplace_back` 进栈的。字段结束时 `EndField` 调 `Push("")`,让所有前缀都"结束",最后 `WriteBlocks(0, stack_.size())` 把栈里剩下的全部写成**根块**。
+
+##### 3.3.2.2 例 A:`body` 的 3 个 term(≤ 25,不触发中间块)
+
+沿用 3.3.3:term 按字节序是 `apple < pie < red`。逐步看栈:
+
+```text
+步骤              pos  检查的前缀(top = 栈高 − prefixes_[i])      prefixes_      stack_ (栈底→栈顶)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Push(apple)       0    (last 为空,不检查)                          [0,0,0,0,0]    [apple]
+Push(pie)         0    i=3,2,1,0: top = 1 − 0 = 1  ≤ 25            [1,1,1]        [apple, pie]
+Push(red)         0    i=2,1,0:   top = 2 − 1 = 1  ≤ 25            [2,2,2]        [apple, pie, red]
+EndField: Push("") 0   i=1,0:     top = 3 − 2 = 1  ≤ 25            []             [apple, pie, red]
+WriteBlocks(0,3)                  没有任何前缀积压超过 25 → 3 个条目一起写成**一个叶子块**                  [block ""]
+```
+
+`WriteBlocks(0, 3)` 里只有一个"剩余块",就是根块,同时也是叶子块。它的字节(`.tm[68,97)`,29 B)和每个字段的含义见 3.3.3 ⑥:
+
+```text
+.tm 文件
+[0,30)    header("block_tree_terms_dict")
+[30,68)   postings_writer 的头:header("iresearch_10_postings_terms") + vint(128)
+[68,97)   body 字段的根块(叶子块)  ← FST: 前缀 "" → 68
+            07              条目数 3,是栈上最后一块
+            1d              后缀区 14 B,叶子
+            apple pie red   后缀区
+            0c              统计区 12 B
+            apple/pie/red   统计区(块内差分)
+```
+
+##### 3.3.2.3 例 B:30 个 term 共享前缀 `t`(> 25,触发嵌套块;假设的例子)
+
+假设另一个字段有 30 个 term `t00, t01, …, t29`,每个 term 只在 1 个文档里出现(`t{k}` 在新文档 `k+1`),无 FREQ / POS;并假设它是本段 `.tm` 的第一个字段(块从 68 开始),`.doc` 里只有 header(40 B),所以每个 term 的 `doc_start` 都是 40。每个 term 的统计是 `vint(docs=1)` `vlong(Δdoc_start)` `vint(e_single_doc=k)`,3 字节。
+
+栈的变化(只列有变化的关键步骤):
+
+```text
+步骤               pos  触发检查                                          prefixes_    stack_
+─────────────────────────────────────────────────────────────────────────────────────────────────────
+Push(t00)          0    (last 为空)                                       [0,0,0]      [t00]
+Push(t01)          2    (i=2 不 > pos,不检查)                              [0,0,1]      [t00,t01]
+  …                                                                        …            …
+Push(t09)          2                                                       [0,0,9]      [t00 … t09]
+Push(t10)          1    i=1(前缀 "t0"): top = 10 − 0 = 10 ≤ 25            [0,10,10]    [t00 … t10]
+  …
+Push(t20)          1    i=1(前缀 "t1"): top = 20 − 10 = 10 ≤ 25           [0,20,20]    [t00 … t20]
+  …
+Push(t29)          2                                                       [0,20,29]    [t00 … t29]
+EndField: Push("")  0   i=1(前缀 "t2"): top = 30 − 20 = 10 ≤ 25
+                        i=0(前缀 "t"):  top = 30 −  0 = 30  > 25  ← 触发!  WriteBlocks(1, 30)
+```
+
+**触发后的第一步:`WriteBlocks(1, 30)`**:前缀 `t`(长度 1)下积压了 30 个条目,而 `30 ≤ max_block_size(48)`,不需要拆成 floor 块,于是 30 个条目写成**一个叶子块**(`.tm[68,252)`,184 B)。栈被替换为一个块条目 `[block "t"]`。
+
+```text
+叶子块  .tm[68,252)  184 B  (前缀 "t",后缀是去掉 "t" 以后的 2 个字符)
+  3d             vint(shift_pack(30, true))    30 个条目,栈上最后一块
+  b5 01          vlong(shift_pack(90, true))   后缀区 90 B,叶子块
+  ── 后缀区 90 B:每条 vint(2) + 2 个字节 ──
+  02 30 30  02 30 31  02 30 32 … 02 32 39      "00" "01" "02" … "29"
+  5a             vlong(90)                     统计区 90 B
+  ── 统计区 90 B:每条 3 B ──
+  01 28 00       t00: docs=1, doc_start=40(块首条目写绝对值), e_single_doc=0
+  01 00 01       t01: docs=1, Δdoc_start=0, e_single_doc=1
+  01 00 02       t02
+  …
+  01 00 1d       t29: e_single_doc=29
+```
+
+**第二步:`WriteBlocks(0, 1)`**:栈里只剩 1 个条目(刚才的块),把它写成**根块**。这个条目是 `ET_BLOCK` 类型,所以根块是**非叶子块**:条目不是 term 而是"指向子块的指针"。
+
+```text
+根块  .tm[252,259)  7 B
+  03             vint(shift_pack(1, true))     1 个条目
+  08             vlong(shift_pack(4, false))   后缀区 4 B,非叶子块(最低位是 0)
+  ── 后缀区:一条 ET_BLOCK 条目 ──
+  03             vint((suf_size=1 << 1) | ET_BLOCK=1)   后缀长 1,类型位=1(块)
+  74             't'
+  b8 01          vlong(block_start − 子块.start = 252 − 68 = 184)   到子块的相对偏移
+  00             vlong(统计区 0 B)              块条目没有 term 统计
+```
+
+现在 `.tm` 里这个字段占 `[68, 259)`,两个块的嵌套关系:
+
+```text
+                        根块  .tm[252,259)   (FST: 前缀 "" → 252)
+                         │ 条目: 前缀 "t" → ET_BLOCK, 相对偏移 184
+                         ▼
+                 叶子块  .tm[68,252)          (FST: 前缀 "t" → 68)
+                         │ 30 个 ET_TERM 条目: 后缀 "00" … "29"
+```
+
+`.ti` 里的字段元信息(字段名、term 数 30、…)后面接**前缀 FST**:它把"前缀 → 块在 `.tm` 里的起点"收进去,逻辑内容是 `"" → 252`、`"t" → 68`(FST 的字节没有展开)。
+
+**查询 `t17`**:FST 里找 `t17` 的最长匹配前缀 → `t`,得到块起点 68 → 读 `.tm[68..]` 的叶子块,在后缀区里找后缀 `17`(第 18 个条目)→ 取统计区第 18 项 `01 00 11`:`docs=1`、`Δdoc_start=0`(累计 `doc_start = 40`)、`e_single_doc=17` → 文档号 `17 + 1 = 18`。不需要读 `.doc`。
+
+**为什么要分块**:term 字典可能有几百万个 term,把每个 term 都放进 FST 会很大。burst trie 的做法是:**FST 只存"前缀 → 块"**,块里再顺序扫描 25~48 个条目。一个前缀下积压的条目数一旦超过 `min_block_size`,就为这个前缀单独写一个块,让每个块的扫描开销有上限。例 A 的 3 个 term 太少,所以全部留在根块;例 B 是最小的"触发中间块"的情形。更大的情形(同一前缀下 > 48 个条目,按首字符再拆成多个 floor 块)没有在这里展开。
 
 #### 3.3.3 例:INDEX 字段 `body` —— 从 `byte_pool_/int_pool_` 到 `.doc` `.pos` `.tm` `.ti` 的字节
 
