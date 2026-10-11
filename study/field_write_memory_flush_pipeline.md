@@ -1910,7 +1910,7 @@ BufferedColumn "norm(body)"
 
 ### 3.3 INDEX → `.tm` `.ti` `.doc` `.pos` `.pay`
 
-> 机制见 3.3.1~3.3.2(3.3.1.2~3.3.1.4 是 `.doc/.pos/.pay` 写入过程的图示和三个例子,3.3.2.2~3.3.2.3 是 `.tm` 块构造的图示和两个例子);沿用 2.8 数据的转换例子:**3.3.3 INDEX 字段 `body`**(多文档 term,有 freq/pos)、**3.3.4 INDEX 字段 `title`**(单文档 term,无 freq/pos)。
+> 机制见 3.3.1~3.3.2(3.3.1.2~3.3.1.4 是 `.doc/.pos/.pay` 写入过程的图示和三个例子,3.3.2.2~3.3.2.4 是 `.tm` 块构造的图示和三个例子);沿用 2.8 数据的转换例子:**3.3.3 INDEX 字段 `body`**(多文档 term,有 freq/pos)、**3.3.4 INDEX 字段 `title`**(单文档 term,无 freq/pos)。
 
 入口 `fields_data::flush`([field_data.cpp:1125](core/index/field_data.cpp#L1125)):
 
@@ -2008,6 +2008,37 @@ t3 ── term red ──  BeginTerm: doc_start=47, pos_start=47
 ```
 
 `red` 的 `.pos` 里 doc2 的位置 `[1,3]` 写成增量 `1, 2`(每个文档内从 0 起算)。**term 之间没有分隔符**:term 的边界靠 `term_meta` 里的 `doc_start` / `pos_start` 记录,由 `.tm` 统计区保存。
+
+**term 的 `term_meta` 去哪了:写进 `.tm`。** `.doc` / `.pos` 里只有 postings 本身,不记"哪段属于哪个 term"。每个 term 的 `term_meta`(`docs_count`、`freq`、`doc_start`、`pos_start`……)由 `field_writer` 带着 term 一起压栈,字段结束时写进 `.tm` 的块的**统计区**。
+
+`.tm` 是 term 字典文件,一个文件里依次是:
+
+```text
+.tm
+[0,30)     header("block_tree_terms_dict")
+[30,68)    postings_writer 的头:header("iresearch_10_postings_terms") + vint(128 = 块大小)
+[68,…)     每个字段的若干个块(叶子块 / 非叶子块),按字段名顺序,块内按 term 字节序
+[…,末尾)   footer 16 B
+```
+
+一个块里写两样东西(格式见 3.3.2):
+
+| 区域 | 内容 | 谁产生 |
+|---|---|---|
+| 后缀区 | 每个 term 去掉块前缀后的字节(`vint(长度)` + 字节),子块条目则是指向子块的偏移 | `field_writer::WriteBlock` |
+| 统计区 | 每个 term 的 `term_meta`,**相对上一个 term 差分编码** | `postings_writer::encode` |
+
+例 A 的三个 `term_meta` 和它们在 `.tm[68,97)` 统计区里的字节(完整的块见 3.3.3 ⑥):
+
+| term | `docs_count` | `freq` | `doc_start` | `pos_start` | 统计区字节 | 逐项含义 |
+|---|---|---|---|---|---|---|
+| `apple` | 3 | 4 | 40 | 40 | `03 01 28 28` | `vint(3)` `vint(4−3=1)` `vlong(40)` `vlong(40)`(块首条目写绝对值) |
+| `pie` | 3 | 3 | 44 | 44 | `03 00 04 04` | `vint(3)` `vint(3−3=0)` `vlong(44−40=4)` `vlong(44−40=4)` |
+| `red` | 2 | 3 | 47 | 47 | `02 01 03 03` | `vint(2)` `vint(3−2=1)` `vlong(47−44=3)` `vlong(47−44=3)` |
+
+- `freq` 存的是 `freq − docs_count`;`doc_start` / `pos_start` 存的是和上一个 term 的差,**这就是 `.doc` / `.pos` 里 term 与 term 之间不需要分隔符的原因**:读的时候先在 `.tm` 里累加差分还原出 `doc_start`,再到 `.doc` 对应位置读 `docs_count` 个文档。
+- 这个字段没有 `pos_end`(`freq ≤ 128`)、`pay_start`(无 PAY/OFFS)、`e_single_doc`(docs 不是 1)、`e_skip_start`(docs ≤ 128),所以每个 term 只有这 4 项。例 B 里的 `pos_end`、`e_skip_start` 和例 C 里的 `pay_start` 才会出现(见各例末尾的统计区字节)。
+- `.tm` 的块里**不存 postings**,也不存分数;它只回答"这个 term 的 postings 在 `.doc` / `.pos` / `.pay` 的哪里、有多少个文档"。term 的定位(前缀 → 哪个块)由 `.ti` 里的 FST 负责。
 
 ##### 3.3.1.3 例 B:300 个文档的 term —— 满块 + skip 列表(假设的例子)
 
@@ -2297,6 +2328,129 @@ EndField: Push("")  0   i=1(前缀 "t2"): top = 30 − 20 = 10 ≤ 25
 **查询 `t17`**:FST 里找 `t17` 的最长匹配前缀 → `t`,得到块起点 68 → 读 `.tm[68..]` 的叶子块,在后缀区里找后缀 `17`(第 18 个条目)→ 取统计区第 18 项 `01 00 11`:`docs=1`、`Δdoc_start=0`(累计 `doc_start = 40`)、`e_single_doc=17` → 文档号 `17 + 1 = 18`。不需要读 `.doc`。
 
 **为什么要分块**:term 字典可能有几百万个 term,把每个 term 都放进 FST 会很大。burst trie 的做法是:**FST 只存"前缀 → 块"**,块里再顺序扫描 25~48 个条目。一个前缀下积压的条目数一旦超过 `min_block_size`,就为这个前缀单独写一个块,让每个块的扫描开销有上限。例 A 的 3 个 term 太少,所以全部留在根块;例 B 是最小的"触发中间块"的情形。更大的情形(同一前缀下 > 48 个条目,按首字符再拆成多个 floor 块)没有在这里展开。
+
+##### 3.3.2.4 例 C:`apple, banana, ahead, head` 逐步构造 `.tm` 块
+
+**前提**(和 3.3.4 的 `title` 类似,便于只看 `.tm`):
+
+- 这是本段第一个字段,`.tm` 里的块从 68 开始(前面是 30 B header + 38 B postings 头);
+- 每个 term 只在 1 个文档里,没有 FREQ / POS:`apple`→文档 1、`banana`→文档 2、`ahead`→文档 3、`head`→文档 4;
+- `.doc` 里此刻只有 40 B header,单文档 term 不往 `.doc` 写字节,所以每个 term 的 `doc_start` 都是 40;
+- 每个 term 的统计是 3 B:`vint(docs=1)` `vlong(Δdoc_start)` `vint(e_single_doc = 文档号 − 1)`。
+
+**第 0 步:先排序。** `fields_data::flush` 对 term 做字节序排序,`field_writer` 收到的顺序是:
+
+```text
+ahead  <  apple  <  banana  <  head
+        'h'(0x68) < 'p'(0x70)      'a' < 'b' < 'h'
+```
+
+排好序是整个算法的基础:**共享前缀的 term 一定挨在一起**,所以只需要对比"上一个 term"就知道哪些前缀结束了,不需要回头看。
+
+**第 1 步:`Push` 逐个处理(默认 `min_block_size = 25`)。** 记住三个状态:`last_term_`、`stack_`、`prefixes_[i]`(长度为 `i+1` 的前缀在 `stack_` 里从第几个位置开始)。每次 `Push` 先把"上一个 term 里已经结束的前缀"检查一遍:前缀 P 下积压的条目数 `top = stack_.size() − prefixes_[i]`,**`top > 25` 才成块**。
+
+| `Push` | 与 `last_term_` 的公共前缀 `pos` | 检查哪些前缀(`i+1` 是前缀长度) | `top` | `prefixes_` | `stack_`(栈底→栈顶) |
+|---|---|---|---|---|---|
+| `ahead` | 0(last 为空) | 无 | — | `[0,0,0,0,0]` | `[ahead]` |
+| `apple` | 1(都以 `a` 开头) | 前缀 `ahea`(i=3)、`ahe`(2)、`ah`(1) | 1,1,1 | `[0,1,1,1,1]` | `[ahead, apple]` |
+| `banana` | 0 | 前缀 `appl`(3)、`app`(2)、`ap`(1)、`a`(0) | 1,1,1,**2** | `[2,2,2,2,2,2]` | `[ahead, apple, banana]` |
+| `head` | 0 | 前缀 `banan`(4)、`bana`(3)、`ban`(2)、`ba`(1)、`b`(0) | 1,1,1,1,1 | `[3,3,3,3]` | `[ahead, apple, banana, head]` |
+| `EndField` 里的 `Push("")` | 0 | 前缀 `hea`(2)、`he`(1)、`h`(0) | 1,1,1 | `[]` | 同上 |
+
+读表要点:
+
+- `apple` 进来时,`ahead` 与它共享前缀 `a`,所以前缀 `a` 还没结束,不检查;`ahead` 的更长前缀(`ah`、`ahe`、`ahea`)结束了,各自只积压 1 个条目。
+- `banana` 进来时,前缀 `a` 结束了,它下面有 `ahead`、`apple` 两个条目:`top = 2`,**但 2 ≤ 25,不成块**。这是整张表里积压最多的一次。
+- 所以直到最后,栈里一直是 4 个 term,没有任何中间块。
+
+**第 2 步:`WriteBlocks(0, 4)` 写根块。** `EndField` 里 `Push("")` 之后,`WriteBlocks(0, stack_.size())` 把栈里全部 4 个条目写成**一个叶子块**(都是 term,没有子块,块元信息 `meta = 1`)。前缀是空串,所以后缀就是整个 term。`.tm[68,107)`,39 B:
+
+```text
+09                          vint(shift_pack(4, true))     4 个条目,是栈上最后一块
+31                          vlong(shift_pack(24, true))   后缀区 24 B,叶子块
+05 61 68 65 61 64           ahead     ┐
+05 61 70 70 6c 65           apple     │ 后缀区:vint(长度) + 字节
+06 62 61 6e 61 6e 61        banana    │
+04 68 65 61 64              head      ┘
+0c                          vlong(12)                     统计区 12 B
+01 28 02                    ahead: docs=1, doc_start=40(块首条目写绝对值), e_single_doc=2
+01 00 00                    apple: docs=1, Δdoc_start=0,  e_single_doc=0
+01 00 01                    banana:                         e_single_doc=1
+01 00 03                    head:                           e_single_doc=3
+```
+
+后缀区和统计区的条目**一一对应、顺序相同**:读到第 k 个后缀就取第 k 项统计。
+
+`.ti` 里的 FST 收到这个块的"索引项":前缀 `""` → 权重 `[meta=01][vlong(block_start=68)=44]` = `01 44`。
+
+**查询**(全部走同一个块):在 FST 里 `""` 匹配 → `.tm[68]` 的叶子块 → 顺序扫描后缀区,比较 `ahead / apple / banana / head`,命中后取同序号的统计项。
+
+---
+
+**默认阈值下 4 个 term 太少,看不出块是怎么嵌套的。** 下面做一个**教学用的假设**:把触发阈值降到 1(积压 > 1 个条目就成块)。注意源码要求 `min_block_size > 1`,真实配置里做不到;这里只是让这 4 个 term 也触发一次,**算法的每一步和上面完全一样**。
+
+| `Push` | 检查结果 | `stack_`(栈底→栈顶) |
+|---|---|---|
+| `ahead` | — | `[ahead]` |
+| `apple` | `ah` / `ahe` / `ahea`:`top=1`,不成块 | `[ahead, apple]` |
+| `banana` | 前缀 `a`:**`top = 2 > 1` → `WriteBlocks(1, 2)`** | 先把 `ahead, apple` 换成块 `[block "a"]`,再放 `banana` → `[block "a", banana]` |
+| `head` | `b…` 的前缀 `top=1`,不成块 | `[block "a", banana, head]` |
+| `Push("")` | `h…` 的前缀 `top=1`,不成块 | 同上 |
+
+**① `WriteBlocks(1, 2)`:前缀 `a` 的子块**(`.tm[68,87)`,19 B,叶子块)。前缀 `a` 不写进块里,只写去掉前缀后的后缀:
+
+```text
+05                  vint(shift_pack(2, true))     2 个条目,当时栈上只有它们
+15                  vlong(shift_pack(10, true))   后缀区 10 B,叶子块
+04 68 65 61 64      "head"    ← ahead 去掉前缀 "a"
+04 70 70 6c 65      "pple"    ← apple 去掉前缀 "a"
+06                  统计区 6 B
+01 28 02            ahead(块首,绝对值)
+01 00 00            apple
+```
+
+这个块在栈里变成一个 `ET_BLOCK` 条目,条目的 `data` 是它的前缀 `a`,同时记着自己在 `.tm` 里的起点 68。
+
+**② 最后的 `WriteBlocks(0, 3)`:根块**(`.tm[87,111)`,24 B)。栈里有 3 个条目:块 `a`、term `banana`、term `head`,既有子块又有 term,所以 `meta = 3`(bit0 有 term,bit1 有子块),是**非叶子块**:
+
+```text
+07                  vint(shift_pack(3, true))     3 个条目,是栈上最后一块
+1e                  vlong(shift_pack(15, false))  后缀区 15 B,非叶子块(最低位 0)
+03 61 13            条目 1(块):vint((1<<1)|ET_BLOCK=1)  'a'  vlong(87 − 68 = 19)   ← 到子块的相对偏移
+0c 62 61 6e 61 6e 61  条目 2(term):vint(6<<1)  "banana"
+08 68 65 61 64      条目 3(term):vint(4<<1)  "head"
+06                  统计区 6 B(只有 term 有统计,块条目没有)
+01 28 01            banana(这个块里第一个 term,绝对值)
+01 00 03            head
+```
+
+非叶子块里每个条目的长度字段是 `(后缀长 << 1) | 类型位`:`03 = (1<<1)|1` 表示"块",`0c = 6<<1`、`08 = 4<<1` 表示"term"。
+
+```text
+                根块  .tm[87,111)    meta=3          (FST: "" → [03][57])
+                │  条目: 块 "a" ──(偏移 19)──┐   term "banana"   term "head"
+                ▼                            ▼
+                        叶子块  .tm[68,87)   meta=1  (FST: "a" → [01][44])
+                        条目: "head"(ahead)   "pple"(apple)
+```
+
+FST 里收到两条:`"" → 03 57`(根块,起点 87 = 0x57)和 `"a" → 01 44`(子块,起点 68 = 0x44)。
+
+**查询**:
+
+| 查 | FST 最长匹配前缀 | 读哪个块 | 过程 |
+|---|---|---|---|
+| `apple` | `a` | `.tm[68]` 叶子块 | 后缀 `pple` 是第 2 个条目 → 统计 `01 00 00` → 文档 1 |
+| `ahead` | `a` | `.tm[68]` 叶子块 | 后缀 `head` 是第 1 个条目 → 统计 `01 28 02` → 文档 3 |
+| `banana` | `""` | `.tm[87]` 根块 | 条目 1(块 `a`)与 `banana` 不匹配;条目 2 就是 `banana` → 统计第 1 项 `01 28 01` → 文档 2 |
+| `head` | `""` | `.tm[87]` 根块 | 条目 3 是 `head` → 统计第 2 项 `01 00 03`(`doc_start` 累加仍是 40)→ 文档 4 |
+
+**这个例子想说明什么**:
+
+1. 块是按**前缀**切出来的:共享前缀的 term 排在一起,积压够多就收成一个块,块内只存后缀;
+2. 块可以嵌套:子块收好之后变成上层块里的一个条目(`ET_BLOCK`),上层块只存"前缀 + 到子块的偏移";
+3. FST 记的是**每个块的前缀和起点**。查 term 时先用 FST 找到最深的匹配块,只读那一个块;
+4. 每个块的统计区是**块内**差分:换块就从绝对值重新开始(上面根块里 `banana` 又是绝对值 `28`)。
 
 #### 3.3.3 例:INDEX 字段 `body` —— 从 `byte_pool_/int_pool_` 到 `.doc` `.pos` `.tm` `.ti` 的字节
 
